@@ -1,0 +1,358 @@
+name: Package and Release
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - alpha
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: Release channel to publish/notify
+        required: true
+        default: release
+        type: choice
+        options:
+          - release
+          - beta
+          - alpha
+      tag_name:
+        description: Tag name to use in release links and notifications
+        required: false
+        default: v0.1.1
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CF_API_KEY: ${{ secrets.CF_API_KEY }}
+  WOWI_API_TOKEN: ${{ secrets.WOWI_API_TOKEN }}
+  WAGO_API_TOKEN: ${{ secrets.WAGO_API_TOKEN }}
+  GITHUB_OAUTH: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine Release Type
+        id: set_release_type
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "release_type=${{ inputs.release_type }}" >> $GITHUB_OUTPUT
+            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+            if [[ -n "${{ inputs.tag_name }}" ]]; then
+              echo "checkout_ref=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+            else
+              echo "checkout_ref=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            fi
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG_NAME="${{ github.ref_name }}"
+            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+            echo "checkout_ref=$TAG_NAME" >> $GITHUB_OUTPUT
+            if [[ "$TAG_NAME" == *"beta"* ]]; then
+              echo "release_type=beta" >> $GITHUB_OUTPUT
+            elif [[ "$TAG_NAME" == *"alpha"* ]]; then
+              echo "release_type=alpha" >> $GITHUB_OUTPUT
+            else
+              echo "release_type=release" >> $GITHUB_OUTPUT
+            fi
+          elif [[ "${{ github.ref }}" == "refs/heads/alpha" ]]; then
+            echo "release_type=alpha" >> $GITHUB_OUTPUT
+            echo "tag_name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "checkout_ref=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "release_type=none" >> $GITHUB_OUTPUT
+            echo "tag_name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "checkout_ref=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Clone Project
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.set_release_type.outputs.checkout_ref }}
+
+      - name: Configure Git user
+        run: |
+          git config --global user.name "donniedice"
+          git config --global user.email "donniedice@protonmail.com"
+
+      - name: Extract Version from TOC
+        id: extract_version
+        run: |
+          if [ -f "EnhancedTravelersLog.toc" ]; then
+            version=$(grep -oP '^## Version: \K(.*)' EnhancedTravelersLog.toc || echo "unknown")
+          else
+            version="${{ github.ref_name }}"
+          fi
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" >> $GITHUB_OUTPUT
+
+      - name: Extract Changelog
+        id: extract_changelog
+        run: |
+          if [ -f "docs/CHANGES.md" ]; then
+            CHANGELOG=$(awk '
+              /^# / {
+                if (in_section) {
+                  exit
+                }
+                in_section=1
+                next
+              }
+              in_section {
+                print
+              }
+            ' docs/CHANGES.md | sed '/./,$!d' | jq -Rs '.')
+            CHANGELOG=${CHANGELOG:1:-1}
+            echo "changelog<<EOF" >> $GITHUB_OUTPUT
+            echo "$CHANGELOG" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "changelog=Check the commit history for changes" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Package Addon
+        uses: BigWigsMods/packager@master
+        if: steps.set_release_type.outputs.release_type != 'none'
+
+      - name: Send Discord Release Notification
+        if: success() && steps.set_release_type.outputs.release_type == 'release'
+        uses: actions/github-script@v7
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          VERSION: ${{ steps.extract_version.outputs.version }}
+          TAG_NAME: ${{ steps.set_release_type.outputs.tag_name }}
+          TIMESTAMP: ${{ steps.extract_version.outputs.timestamp }}
+          CHANGELOG: ${{ steps.extract_changelog.outputs.changelog }}
+        with:
+          script: |
+            if (!process.env.DISCORD_WEBHOOK) {
+              throw new Error('DISCORD_WEBHOOK secret is not configured.');
+            }
+            let changelog = process.env.CHANGELOG || 'Check the commit history for changes';
+            changelog = changelog.replace(/\\n/g, '\n');
+            if (changelog.length > 3500) {
+              changelog = changelog.slice(0, 3497) + '...';
+            }
+
+            const payload = {
+              "username": "ETL Release",
+              "avatar_url": "https://raw.githubusercontent.com/DonnieDice/EnhancedTravelersLog/main/media/logo.png",
+              "embeds": [{
+                "title": "📖 ETL | Enhanced Traveler's Log - " + process.env.VERSION,
+                "description": "**Track Traveler's Log progress with cleaner bars and quick access from the minimap.**\n\n📋 **What's New:**\n" + changelog,
+                "url": "https://github.com/DonnieDice/EnhancedTravelersLog/releases/tag/" + process.env.TAG_NAME,
+                "color": 9764929,
+                "thumbnail": {
+                  "url": "https://raw.githubusercontent.com/DonnieDice/EnhancedTravelersLog/main/media/logo.png"
+                },
+                "fields": [
+                  {
+                    "name": "📥 Downloads",
+                    "value": "[CurseForge](https://www.curseforge.com/wow/addons/enhanced-travelers-log)\n[Wago.io](https://addons.wago.io/addons/enhanced-travelers-log)\n[WoWInterface](https://www.wowinterface.com/downloads/info26643)\n[GitHub](https://github.com/DonnieDice/EnhancedTravelersLog)",
+                    "inline": true
+                  },
+                  {
+                    "name": "🎮 Compatibility",
+                    "value": "✅ Midnight",
+                    "inline": true
+                  },
+                  {
+                    "name": "💬 Support",
+                    "value": "[Join Discord](https://discord.gg/N7kdKAHVVF)\n[Report Issues](https://github.com/DonnieDice/EnhancedTravelersLog/issues)",
+                    "inline": true
+                  }
+                ],
+                "footer": {
+                  "text": "RGX Mods - RealmGX Community",
+                  "icon_url": "https://raw.githubusercontent.com/donniedice/SimpleQuestPlates/main/media/kiwi.gif"
+                },
+                "timestamp": process.env.TIMESTAMP
+              }]
+            };
+            const response = await fetch(process.env.DISCORD_WEBHOOK, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify(payload)
+            });
+            const responseText = await response.text();
+            if (!response.ok) {
+              throw new Error(`Discord notification failed: ${response.status} ${response.statusText} ${responseText}`);
+            }
+            console.log(`Discord notification sent. Status: ${response.status}`);
+
+      - name: Send Discord Beta Notification
+        if: success() && steps.set_release_type.outputs.release_type == 'beta'
+        uses: actions/github-script@v7
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          VERSION: ${{ steps.extract_version.outputs.version }}
+          TAG_NAME: ${{ steps.set_release_type.outputs.tag_name }}
+          TIMESTAMP: ${{ steps.extract_version.outputs.timestamp }}
+          CHANGELOG: ${{ steps.extract_changelog.outputs.changelog }}
+        with:
+          script: |
+            if (!process.env.DISCORD_WEBHOOK) {
+              throw new Error('DISCORD_WEBHOOK secret is not configured.');
+            }
+            let changelog = process.env.CHANGELOG || 'Check the commit history for changes';
+            changelog = changelog.replace(/\\n/g, '\n');
+            if (changelog.length > 3500) {
+              changelog = changelog.slice(0, 3497) + '...';
+            }
+
+            const payload = {
+              "username": "ETL Beta",
+              "avatar_url": "https://raw.githubusercontent.com/DonnieDice/EnhancedTravelersLog/main/media/logo.png",
+              "embeds": [{
+                "title": "🧪 ETL Beta - " + process.env.VERSION,
+                "description": "**Track Traveler's Log progress with cleaner bars and quick access from the minimap.** A beta build of ETL is ready for testing!\n\n📋 **What's New:**\n" + changelog,
+                "url": "https://github.com/DonnieDice/EnhancedTravelersLog/releases/tag/" + process.env.TAG_NAME,
+                "color": 16744448,
+                "thumbnail": {
+                  "url": "https://raw.githubusercontent.com/DonnieDice/EnhancedTravelersLog/main/media/logo.png"
+                },
+                "fields": [
+                  {
+                    "name": "📥 Download Beta",
+                    "value": "[CurseForge](https://www.curseforge.com/wow/addons/enhanced-travelers-log)\n[Wago.io](https://addons.wago.io/addons/enhanced-travelers-log)\n[WoWInterface](https://www.wowinterface.com/downloads/info26643)\n[GitHub](https://github.com/DonnieDice/EnhancedTravelersLog/releases)",
+                    "inline": true
+                  },
+                  {
+                    "name": "💬 Support",
+                    "value": "[Join Discord](https://discord.gg/N7kdKAHVVF)\n[Report Issues](https://github.com/DonnieDice/EnhancedTravelersLog/issues)",
+                    "inline": true
+                  }
+                ],
+                "footer": {
+                  "text": "RGX Mods - RealmGX Community",
+                  "icon_url": "https://raw.githubusercontent.com/donniedice/SimpleQuestPlates/main/media/kiwi.gif"
+                },
+                "timestamp": process.env.TIMESTAMP
+              }]
+            };
+            const response = await fetch(process.env.DISCORD_WEBHOOK, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify(payload)
+            });
+            const responseText = await response.text();
+            if (!response.ok) {
+              throw new Error(`Discord notification failed: ${response.status} ${response.statusText} ${responseText}`);
+            }
+            console.log(`Discord notification sent. Status: ${response.status}`);
+
+      - name: Send Discord Alpha Notification
+        if: success() && steps.set_release_type.outputs.release_type == 'alpha'
+        uses: actions/github-script@v7
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          VERSION: ${{ steps.extract_version.outputs.version }}
+          TIMESTAMP: ${{ steps.extract_version.outputs.timestamp }}
+          CHANGELOG: ${{ steps.extract_changelog.outputs.changelog }}
+        with:
+          script: |
+            if (!process.env.DISCORD_WEBHOOK) {
+              throw new Error('DISCORD_WEBHOOK secret is not configured.');
+            }
+            let changelog = process.env.CHANGELOG || 'Check the commit history for changes';
+            changelog = changelog.replace(/\\n/g, '\n');
+            if (changelog.length > 3500) {
+              changelog = changelog.slice(0, 3497) + '...';
+            }
+
+            const payload = {
+              "username": "ETL Alpha",
+              "avatar_url": "https://raw.githubusercontent.com/DonnieDice/EnhancedTravelersLog/main/media/logo.png",
+              "embeds": [{
+                "title": "🔬 ETL Alpha - " + process.env.VERSION,
+                "description": "**Track Traveler's Log progress with cleaner bars and quick access from the minimap.** Development snapshot for internal testing.\n\n📋 **What's New:**\n" + changelog,
+                "url": "https://github.com/DonnieDice/EnhancedTravelersLog",
+                "color": 16711680,
+                "thumbnail": {
+                  "url": "https://raw.githubusercontent.com/DonnieDice/EnhancedTravelersLog/main/media/logo.png"
+                },
+                "footer": {
+                  "text": "RGX Mods - RealmGX Community",
+                  "icon_url": "https://raw.githubusercontent.com/donniedice/SimpleQuestPlates/main/media/kiwi.gif"
+                },
+                "timestamp": process.env.TIMESTAMP
+              }]
+            };
+            const response = await fetch(process.env.DISCORD_WEBHOOK, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify(payload)
+            });
+            const responseText = await response.text();
+            if (!response.ok) {
+              throw new Error(`Discord notification failed: ${response.status} ${response.statusText} ${responseText}`);
+            }
+            console.log(`Discord notification sent. Status: ${response.status}`);
+
+      - name: Send Discord Failure Notification
+        if: failure()
+        uses: actions/github-script@v7
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          VERSION: ${{ steps.extract_version.outputs.version }}
+          TIMESTAMP: ${{ steps.extract_version.outputs.timestamp }}
+          RUN_ID: ${{ github.run_id }}
+        with:
+          script: |
+            if (!process.env.DISCORD_WEBHOOK) {
+              throw new Error('DISCORD_WEBHOOK secret is not configured.');
+            }
+
+            const payload = {
+              "username": "ETL Build Failed",
+              "avatar_url": "https://raw.githubusercontent.com/DonnieDice/EnhancedTravelersLog/main/media/logo.png",
+              "embeds": [{
+                "title": "❌ ETL Build Failed",
+                "description": "The release workflow encountered an error",
+                "url": "https://github.com/DonnieDice/EnhancedTravelersLog/actions/runs/" + process.env.RUN_ID,
+                "color": 15158332,
+                "thumbnail": {
+                  "url": "https://raw.githubusercontent.com/DonnieDice/EnhancedTravelersLog/main/media/logo.png"
+                },
+                "fields": [
+                  {
+                    "name": "Version",
+                    "value": process.env.VERSION || 'Unknown',
+                    "inline": true
+                  },
+                  {
+                    "name": "Workflow",
+                    "value": "[View Logs](https://github.com/DonnieDice/EnhancedTravelersLog/actions/runs/" + process.env.RUN_ID + ")",
+                    "inline": true
+                  }
+                ],
+                "footer": {
+                  "text": "RGX Mods - RealmGX Community",
+                  "icon_url": "https://raw.githubusercontent.com/donniedice/SimpleQuestPlates/main/media/kiwi.gif"
+                },
+                "timestamp": process.env.TIMESTAMP
+              }]
+            };
+            const response = await fetch(process.env.DISCORD_WEBHOOK, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify(payload)
+            });
+            const responseText = await response.text();
+            if (!response.ok) {
+              throw new Error(`Discord notification failed: ${response.status} ${response.statusText} ${responseText}`);
+            }
+            console.log(`Discord notification sent. Status: ${response.status}`);
