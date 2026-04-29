@@ -1,3 +1,10 @@
+# v0.1.7 - 2026-04-29
+
+## Documentation
+
+- Synced version metadata after documentation updates.
+- Moved the v0.1.3 changelog entry into the documented changelog folder.
+
 # v0.1.6 - 2026-04-28
 
 ## Bug Fixes
